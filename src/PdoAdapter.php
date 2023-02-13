@@ -21,17 +21,32 @@ class PdoAdapter implements FilesystemAdapter
 {
     public const DUMMY_FILE_FOR_FORCED_LISTING_IN_FLYSYSTEM_TEST = '______DUMMY_FILE_FOR_FORCED_LISTING_IN_FLYSYSTEM_TEST';
 
-    /** @var \PDO */
-    private $pdo;
+    private \PDO $pdo;
+
     private string $table = 'files';
+
+    private string $bucket = 'default';
+
+    private string $cacheDirectory = '/tmp';
+
+    private string $cachePrefix = 'flypdo-';
+
+    private int $cacheMaxAge = 300; // in seconds
+
+    private int $cacheCleanupChance = 100; // 1:100 cleanup chance for each read
+
     private MimeTypeDetector $mimeTypeDetector;
 
     public function __construct(
         \PDO $pdo,
+        string $bucket = 'default',
+        string $table = 'files',
         private string $defaultVisibility = Visibility::PUBLIC,
         MimeTypeDetector $mimeTypeDetector = null
     ) {
         $this->pdo = $pdo;
+        $this->bucket = $bucket;
+        $this->table = $table;
         $this->mimeTypeDetector = $mimeTypeDetector ?: new FinfoMimeTypeDetector();
     }
 
@@ -39,10 +54,10 @@ class PdoAdapter implements FilesystemAdapter
     {
         $path = $this->preparePath($path);
         $statement = $this->pdo->prepare(
-            'SELECT `size`,visibility,UNIX_TIMESTAMP(lastModified) as lastModified,mimeType 
-                FROM files WHERE path = ?'
+            'SELECT `size`, visibility, UNIX_TIMESTAMP(lastModified) as lastModified, mimeType
+                FROM '.$this->table.' WHERE bucket = ? AND path = ?'
         );
-        $statement->execute([$path]);
+        $statement->execute([$this->bucket, $path]);
         if (1 !== $statement->rowCount()) {
             throw new UnableToReadFile($path);
         }
@@ -60,8 +75,8 @@ class PdoAdapter implements FilesystemAdapter
 
     public function fileExists(string $path): bool
     {
-        $statement = $this->pdo->prepare('SELECT * FROM files WHERE path = ?');
-        $statement->execute([$this->preparePath($path)]);
+        $statement = $this->pdo->prepare('SELECT path FROM '.$this->table.' WHERE bucket = ? AND path = ?');
+        $statement->execute([$this->bucket, $this->preparePath($path)]);
         $cnt = $statement->rowCount();
 
         return 1 === $cnt;
@@ -82,31 +97,41 @@ class PdoAdapter implements FilesystemAdapter
         }
 
         $visibility = (string) $config->get(Config::OPTION_VISIBILITY, $this->defaultVisibility);
-        $statement = $this->pdo->prepare('REPLACE INTO files(path, contents, mimeType, `size`, visibility, lastModified, checksum) VALUES (?, ?, ?, ?, ?, ?, ?)');
+        $statement = $this->pdo->prepare('REPLACE INTO '.$this->table.'(bucket, path, contents, mimeType, `size`, visibility, lastModified, checksum) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
         $statement->execute(
             [
+                $this->bucket,
                 $path,
                 $contents,
                 $mimeType,
                 strlen($contents),
                 $visibility,
                 date('Y-m-d H:i:s', $timestamp),
-                sha1($contents),
+                $this->getChecksumForContent($contents),
             ]
         );
+        $this->writeToCache($path, $contents);
     }
 
     public function writeStream(string $path, $contents, Config $config): void
     {
-        $this->write($path, (string) stream_get_contents($contents), $config);
+        $contents = (string) stream_get_contents($contents);
+        $this->write($path, $contents, $config);
     }
 
     public function read(string $path): string
     {
         $path = $this->preparePath($path);
 
-        $statement = $this->pdo->prepare('SELECT contents FROM files WHERE path = ?');
-        $statement->execute([$path]);
+        $contents = $this->readFromCache($path);
+        if (null !== $contents) {
+            if ($this->getChecksumForContent($contents) === $this->getChecksumForPath($path)) {
+                return $contents;
+            }
+        }
+
+        $statement = $this->pdo->prepare('SELECT contents FROM '.$this->table.' WHERE bucket = ? AND path = ?');
+        $statement->execute([$this->bucket, $path]);
         $cnt = $statement->rowCount();
         if (1 !== $cnt) {
             throw UnableToReadFile::fromLocation($path, 'file does not exist');
@@ -114,24 +139,27 @@ class PdoAdapter implements FilesystemAdapter
         /** @var array $row */
         $row = $statement->fetch();
 
-        return (string) $row['contents'];
+        $contents = (string) $row['contents'];
+        $this->cleanupCache();
+        $this->writeToCache($path, $contents);
+
+        return $contents;
     }
 
     public function readStream(string $path)
     {
-        $contents = $this->read($path);
-        $stream = fopen('php://memory', 'r+');
-        fwrite($stream, $contents);
-        rewind($stream);
+        $path = $this->preparePath($path);
+        $this->read($path); // creates cache local file
+        $filename = $this->getCacheFilename($path);
 
-        return $stream;
+        return fopen($filename, 'r');
     }
 
     public function delete(string $path): void
     {
         $path = $this->preparePath($path);
-        $statement = $this->pdo->prepare('DELETE FROM files where path = ?');
-        $statement->execute([$this->preparePath($path)]);
+        $statement = $this->pdo->prepare('DELETE FROM '.$this->table.' where bucket = ? AND path = ?');
+        $statement->execute([$this->bucket, $this->preparePath($path)]);
     }
 
     public function deleteDirectory(string $path): void
@@ -139,8 +167,8 @@ class PdoAdapter implements FilesystemAdapter
         $path = $this->preparePath($path);
         $path = \rtrim($path, '/').'/';
 
-        $statement = $this->pdo->prepare('DELETE FROM files where path like ?');
-        $statement->execute([$path.'%']);
+        $statement = $this->pdo->prepare('DELETE FROM '.$this->table.' where bucket = ? AND path like ?');
+        $statement->execute([$this->bucket, $path.'%']);
         $this->delete(\rtrim($this->preparePath($path), '/'));
     }
 
@@ -155,8 +183,8 @@ class PdoAdapter implements FilesystemAdapter
         $prefix = $this->preparePath($path);
         $prefix = \rtrim($prefix, '/').'/';
 
-        $statement = $this->pdo->prepare('SELECT * FROM files WHERE path like ?');
-        $statement->execute([$prefix.'%']);
+        $statement = $this->pdo->prepare('SELECT path FROM '.$this->table.' WHERE bucket = ? AND path like ? LIMIT 1');
+        $statement->execute([$this->bucket, $prefix.'%']);
 
         return 1 == $statement->rowCount();
     }
@@ -168,8 +196,8 @@ class PdoAdapter implements FilesystemAdapter
         }
         $path = $this->preparePath($path);
 
-        $statement = $this->pdo->prepare('UPDATE files SET visibility = ? WHERE path = ?');
-        $statement->execute([$visibility, $path]);
+        $statement = $this->pdo->prepare('UPDATE '.$this->table.' SET visibility = ? WHERE bucket = ? AND path = ?');
+        $statement->execute([$visibility, $this->bucket, $path]);
     }
 
     public function visibility(string $path): FileAttributes
@@ -179,13 +207,6 @@ class PdoAdapter implements FilesystemAdapter
         } catch (\Exception) {
             throw new UnableToRetrieveMetadata();
         }
-        /*
-        $path = $this->preparePath($path);
-
-        if (array_key_exists($path, $this->files) === false) {
-            throw UnableToRetrieveMetadata::visibility($path, 'file does not exist');
-        }
-        */
     }
 
     public function mimeType(string $path): FileAttributes
@@ -231,12 +252,12 @@ class PdoAdapter implements FilesystemAdapter
         $prefixLength = strlen($prefix);
         $listedDirectories = [];
 
-        $statement = $this->pdo->prepare('SELECT * FROM files WHERE path LIKE ?');
-        $statement->execute([$prefix.'%']);
+        $statement = $this->pdo->prepare('SELECT path FROM '.$this->table.' WHERE bucket = ? AND path LIKE ?');
+        $statement->execute([$this->bucket, $prefix.'%']);
 
         while (
             /** @var array|false $row */
-            $row = $statement->fetch(\PDO::FETCH_ASSOC)
+        $row = $statement->fetch(\PDO::FETCH_ASSOC)
         ) {
             $path = (string) $row['path'];
             if (substr($path, 0, $prefixLength) === $prefix) {
@@ -306,9 +327,64 @@ class PdoAdapter implements FilesystemAdapter
         return '/'.ltrim($path, '/');
     }
 
+    private function getCacheFilename(string $path): string
+    {
+        $cacheKey = sha1($this->bucket.$path);
+
+        return $this->cacheDirectory.'/'.$this->cachePrefix.$cacheKey;
+    }
+
+    private function writeToCache(string $path, string $contents): void
+    {
+        file_put_contents($this->getCacheFilename($path), $contents);
+    }
+
+    private function readFromCache(string $path): ?string
+    {
+        $filename = $this->getCacheFilename($path);
+        if (file_exists($filename)) {
+            return file_get_contents($filename);
+        }
+
+        return null;
+    }
+
+    private function cleanupCache(): void
+    {
+        if (rand(1, $this->cacheCleanupChance) !== $this->cacheCleanupChance) {
+            return; // bail out
+        }
+
+        $files = new \DirectoryIterator($this->cacheDirectory);
+        foreach ($files as $fileinfo) {
+            if ($fileinfo->isFile()) {
+                if (str_starts_with($fileinfo->getBasename(), $this->cachePrefix)) {
+                    if ((time() - $fileinfo->getATime()) > $this->cacheMaxAge) {
+                        \Safe\unlink($fileinfo->getPathname());
+                    }
+                }
+            }
+        }
+    }
+
+    private function getChecksumForPath(string $path): string
+    {
+        $path = $this->preparePath($path);
+
+        $statement = $this->pdo->prepare('SELECT checksum FROM '.$this->table.' WHERE bucket = ? AND path like ? LIMIT 1');
+        $statement->execute([$this->bucket, $path]);
+
+        return (string) $statement->fetch(\PDO::FETCH_COLUMN);
+    }
+
+    private function getChecksumForContent(string $content): string
+    {
+        return sha1($content);
+    }
+
     public function deleteEverything(): void
     {
-        $statement = $this->pdo->prepare('DELETE FROM files');
-        $statement->execute([]);
+        $statement = $this->pdo->prepare('DELETE FROM '.$this->table.' WHERE bucket = ?');
+        $statement->execute([$this->bucket]);
     }
 }

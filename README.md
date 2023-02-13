@@ -12,15 +12,16 @@ $ composer require basilicom/flysystem-pdo`
 Prepare a (MySQL) table:
 ```
 create table files (
+	bucket varchar(32) not null default 'default',
 	path varchar(255) not null,
 	isFile tinyint not null default 1,
 	mimeType varchar(64) not null default '',
-	contents blob not null,
+	contents longblob not null,
 	size int unsigned not null default 0,
 	checksum varchar(256) not null,
 	lastModified datetime,
 	visibility varchar(64),
-	PRIMARY KEY(path)
+	PRIMARY KEY(bucket, path)
 );
 ```
 
@@ -31,7 +32,7 @@ use League\Flysystem\Filesystem;
 use Basilicom\Flysystem\Pdo\PdoAdapter;
 
 $pdo = new PDO('mysql:host=mysql;dbname=mydb', 'myuser', 'mypass');
-$adapter = new \Basilicom\Fly\PdoFilesystemAdapter($pdo);
+$adapter = new \Basilicom\Flysystem\Pdo\PdoFilesystemAdapter($pdo);
 
 $flysystem = new Filesystem($adapter);
 ```
