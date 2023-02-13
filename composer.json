@@ -13,8 +13,9 @@
     ],
     "require": {
         "php": "8.0.* || 8.1.* || 8.2.*",
+        "ext-pdo": "*",
         "league/flysystem": "^3.0",
-        "ext-pdo": "*"
+        "thecodingmachine/safe": "^2.4"
     },
     "require-dev": {
         "friendsofphp/php-cs-fixer": "^3.0",

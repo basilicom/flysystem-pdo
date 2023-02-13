@@ -1,5 +1,9 @@
 # Flysystem v3 PDO adapter
 
+![Psalm coverage](https://shepherd.dev/github/basilicom/flysystem-pdo/coverage.svg)
+![Psalm level](https://shepherd.dev/github/basilicom/flysystem-pdo/level.svg)
+
+
 A (very simple) [Flysystem][1] v3 adapter for PDO/MySQL`.
 Based on the https://github.com/thephpleague/flysystem-memory implementation.
 
@@ -32,7 +36,7 @@ use League\Flysystem\Filesystem;
 use Basilicom\Flysystem\Pdo\PdoAdapter;
 
 $pdo = new PDO('mysql:host=mysql;dbname=mydb', 'myuser', 'mypass');
-$adapter = new \Basilicom\Flysystem\Pdo\PdoFilesystemAdapter($pdo);
+$adapter = new \Basilicom\Flysystem\Pdo\PdoAdapter($pdo);
 
 $flysystem = new Filesystem($adapter);
 ```
